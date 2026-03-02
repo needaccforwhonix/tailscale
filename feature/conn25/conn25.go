@@ -563,7 +563,7 @@ type addrAssignments struct {
 
 func (a *addrAssignments) insert(as addrs) {
 	mak.Set(&a.byMagicIP, as.magic, as)
-	mak.Set(&a.byDomainDst, domainDst{domain: dnsname.FQDN(as.domain), dst: as.dst}, as)
+	mak.Set(&a.byDomainDst, domainDst{domain: as.domain, dst: as.dst}, as)
 }
 
 func (a *addrAssignments) lookupByDomainDst(domain dnsname.FQDN, dst netip.Addr) (addrs, bool) {
