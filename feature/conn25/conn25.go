@@ -566,13 +566,6 @@ func (a *addrAssignments) insert(as addrs) {
 	mak.Set(&a.byDomainDst, domainDst{domain: dnsname.FQDN(as.domain), dst: as.dst}, as)
 }
 
-// TODO(fran) we will use this when a network flow wants to find if an address is
-// a magic ip and what it relates to.
-//func (a *addrAssignments) lookupByMagicIP(ip netip.Addr) (addrs, bool) {
-//v, ok := a.byMagicIP[ip]
-//return v, ok
-//}
-
 func (a *addrAssignments) lookupByDomainDst(domain dnsname.FQDN, dst netip.Addr) (addrs, bool) {
 	v, ok := a.byDomainDst[domainDst{domain: domain, dst: dst}]
 	return v, ok
