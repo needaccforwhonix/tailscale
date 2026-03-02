@@ -1493,6 +1493,14 @@ func (lc *localAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			panic(fmt.Sprintf("unsupported method %q", r.Method))
 		}
+	// In the localAPI ServeHTTP method
+	case "/localapi/v0/disconnect-control":
+		if r.Method == "POST" {
+			w.WriteHeader(http.StatusOK)
+			return
+		} else {
+			panic(fmt.Sprintf("unsupported method %q", r.Method))
+		}
 	default:
 		panic(fmt.Sprintf("unsupported path %q", r.URL.Path))
 	}
