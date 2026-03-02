@@ -432,15 +432,17 @@ func (c *client) reserveAddresses(domain dnsname.FQDN, dst netip.Addr) (addrs, e
 	if err != nil {
 		return addrs{}, err
 	}
-	addrs := addrs{
+	as := addrs{
 		dst:     dst,
 		magic:   mip,
 		transit: tip,
 		app:     app,
 		domain:  domain,
 	}
-	c.assignments.insert(addrs)
-	return addrs, nil
+	if err := c.assignments.insert(as); err != nil {
+		return addrs{}, err
+	}
+	return as, nil
 }
 
 func (c *client) enqueueAddressAssignment(addrs addrs) {
@@ -561,9 +563,19 @@ type addrAssignments struct {
 	byDomainDst map[domainDst]addrs
 }
 
-func (a *addrAssignments) insert(as addrs) {
+func (a *addrAssignments) insert(as addrs) error {
+	// we likely will want to allow overwriting in the future when we
+	// have address expiry, but for now this should not happen
+	if _, ok := a.byMagicIP[as.magic]; ok {
+		return errors.New("byMagicIP key exists")
+	}
+	ddst := domainDst{domain: as.domain, dst: as.dst}
+	if _, ok := a.byDomainDst[ddst]; ok {
+		return errors.New("byDomainDst key exists")
+	}
 	mak.Set(&a.byMagicIP, as.magic, as)
-	mak.Set(&a.byDomainDst, domainDst{domain: as.domain, dst: as.dst}, as)
+	mak.Set(&a.byDomainDst, ddst, as)
+	return nil
 }
 
 func (a *addrAssignments) lookupByDomainDst(domain dnsname.FQDN, dst netip.Addr) (addrs, bool) {
