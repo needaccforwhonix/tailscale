@@ -16,6 +16,8 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/appctype"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/dnsname"
+	"tailscale.com/util/must"
 	"tailscale.com/util/set"
 )
 
@@ -210,7 +212,7 @@ func TestReserveIPs(t *testing.T) {
 	c := newConn25(logger.Discard)
 	c.client.magicIPPool = newIPPool(mustIPSetFromPrefix("100.64.0.0/24"))
 	c.client.transitIPPool = newIPPool(mustIPSetFromPrefix("169.254.0.0/24"))
-	mbd := map[string][]string{}
+	mbd := map[dnsname.FQDN][]string{}
 	mbd["example.com."] = []string{"a"}
 	c.client.config.appsByDomain = mbd
 
@@ -224,7 +226,7 @@ func TestReserveIPs(t *testing.T) {
 	wantMagic := netip.MustParseAddr("100.64.0.0")    // first from magic pool
 	wantTransit := netip.MustParseAddr("169.254.0.0") // first from transit pool
 	wantApp := "a"                                    // the app name related to example.com.
-	wantDomain := "example.com."
+	wantDomain := must.Get(dnsname.ToFQDN("example.com."))
 
 	if wantDst != addrs.dst {
 		t.Errorf("want %v, got %v", wantDst, addrs.dst)
@@ -273,8 +275,8 @@ func TestConfigReconfig(t *testing.T) {
 		cfg                   []appctype.Conn25Attr
 		tags                  []string
 		wantErr               bool
-		wantAppsByDomain      map[string][]string
-		wantSelfRoutedDomains set.Set[string]
+		wantAppsByDomain      map[dnsname.FQDN][]string
+		wantSelfRoutedDomains set.Set[dnsname.FQDN]
 	}{
 		{
 			name:    "bad-config",
@@ -288,11 +290,11 @@ func TestConfigReconfig(t *testing.T) {
 				{Name: "two", Domains: []string{"b.example.com"}, Connectors: []string{"tag:two"}},
 			},
 			tags: []string{"tag:one"},
-			wantAppsByDomain: map[string][]string{
+			wantAppsByDomain: map[dnsname.FQDN][]string{
 				"a.example.com.": {"one"},
 				"b.example.com.": {"two"},
 			},
-			wantSelfRoutedDomains: set.SetOf([]string{"a.example.com."}),
+			wantSelfRoutedDomains: set.SetOf([]dnsname.FQDN{"a.example.com."}),
 		},
 		{
 			name: "more-complex",
@@ -303,7 +305,7 @@ func TestConfigReconfig(t *testing.T) {
 				{Name: "four", Domains: []string{"4.b.example.com", "4.d.example.com"}, Connectors: []string{"tag:four"}},
 			},
 			tags: []string{"tag:onea", "tag:four", "tag:unrelated"},
-			wantAppsByDomain: map[string][]string{
+			wantAppsByDomain: map[dnsname.FQDN][]string{
 				"1.a.example.com.": {"one"},
 				"1.b.example.com.": {"one", "three"},
 				"1.c.example.com.": {"three"},
@@ -312,7 +314,7 @@ func TestConfigReconfig(t *testing.T) {
 				"4.b.example.com.": {"four"},
 				"4.d.example.com.": {"four"},
 			},
-			wantSelfRoutedDomains: set.SetOf([]string{"1.a.example.com.", "1.b.example.com.", "4.b.example.com.", "4.d.example.com."}),
+			wantSelfRoutedDomains: set.SetOf([]dnsname.FQDN{"1.a.example.com.", "1.b.example.com.", "4.b.example.com.", "4.d.example.com."}),
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -497,7 +499,7 @@ func TestReserveAddressesDeduplicated(t *testing.T) {
 	c := newConn25(logger.Discard)
 	c.client.magicIPPool = newIPPool(mustIPSetFromPrefix("100.64.0.0/24"))
 	c.client.transitIPPool = newIPPool(mustIPSetFromPrefix("169.254.0.0/24"))
-	c.client.config.appsByDomain = map[string][]string{"example.com.": {"a"}}
+	c.client.config.appsByDomain = map[dnsname.FQDN][]string{"example.com.": {"a"}}
 
 	dst := netip.MustParseAddr("0.0.0.1")
 	first, err := c.client.reserveAddresses("example.com.", dst)
