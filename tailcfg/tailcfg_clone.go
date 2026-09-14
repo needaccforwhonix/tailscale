@@ -10,10 +10,10 @@ import (
 	"net/netip"
 	"time"
 
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/structs"
 	"tailscale.com/types/tkatype"
 )
@@ -53,23 +53,23 @@ func (src *Node) Clone() *Node {
 	dst.Tags = append(src.Tags[:0:0], src.Tags...)
 	dst.PrimaryRoutes = append(src.PrimaryRoutes[:0:0], src.PrimaryRoutes...)
 	if dst.LastSeen != nil {
-		dst.LastSeen = ptr.To(*src.LastSeen)
+		dst.LastSeen = new(*src.LastSeen)
 	}
 	if dst.Online != nil {
-		dst.Online = ptr.To(*src.Online)
+		dst.Online = new(*src.Online)
 	}
 	dst.Capabilities = append(src.Capabilities[:0:0], src.Capabilities...)
 	if dst.CapMap != nil {
-		dst.CapMap = map[NodeCapability][]RawMessage{}
+		dst.CapMap = map[nodecap.Cap][]RawMessage{}
 		for k := range src.CapMap {
 			dst.CapMap[k] = append([]RawMessage{}, src.CapMap[k]...)
 		}
 	}
 	if dst.SelfNodeV4MasqAddrForThisPeer != nil {
-		dst.SelfNodeV4MasqAddrForThisPeer = ptr.To(*src.SelfNodeV4MasqAddrForThisPeer)
+		dst.SelfNodeV4MasqAddrForThisPeer = new(*src.SelfNodeV4MasqAddrForThisPeer)
 	}
 	if dst.SelfNodeV6MasqAddrForThisPeer != nil {
-		dst.SelfNodeV6MasqAddrForThisPeer = ptr.To(*src.SelfNodeV6MasqAddrForThisPeer)
+		dst.SelfNodeV6MasqAddrForThisPeer = new(*src.SelfNodeV6MasqAddrForThisPeer)
 	}
 	if src.ExitNodeDNSResolvers != nil {
 		dst.ExitNodeDNSResolvers = make([]*dnstype.Resolver, len(src.ExitNodeDNSResolvers))
@@ -100,7 +100,7 @@ var _NodeCloneNeedsRegeneration = Node(struct {
 	AllowedIPs                    []netip.Prefix
 	Endpoints                     []netip.AddrPort
 	LegacyDERPString              string
-	HomeDERP                      int
+	HomeDERP                      DERPRegionID
 	Hostinfo                      HostinfoView
 	Created                       time.Time
 	Cap                           CapabilityVersion
@@ -109,7 +109,7 @@ var _NodeCloneNeedsRegeneration = Node(struct {
 	LastSeen                      *time.Time
 	Online                        *bool
 	MachineAuthorized             bool
-	Capabilities                  []NodeCapability
+	Capabilities                  []nodecap.Cap
 	CapMap                        NodeCapMap
 	UnsignedPeerAPIOnly           bool
 	ComputedName                  string
@@ -139,10 +139,10 @@ func (src *Hostinfo) Clone() *Hostinfo {
 	dst.NetInfo = src.NetInfo.Clone()
 	dst.SSH_HostKeys = append(src.SSH_HostKeys[:0:0], src.SSH_HostKeys...)
 	if dst.Location != nil {
-		dst.Location = ptr.To(*src.Location)
+		dst.Location = new(*src.Location)
 	}
 	if dst.TPM != nil {
-		dst.TPM = ptr.To(*src.TPM)
+		dst.TPM = new(*src.TPM)
 	}
 	return dst
 }
@@ -168,6 +168,7 @@ var _HostinfoCloneNeedsRegeneration = Hostinfo(struct {
 	ShieldsUp       bool
 	ShareeNode      bool
 	NoLogsNoSupport bool
+	RemoteConfig    bool
 	WireIngress     bool
 	IngressEnabled  bool
 	AllowsUpdate    bool
@@ -216,7 +217,7 @@ var _NetInfoCloneNeedsRegeneration = NetInfo(struct {
 	UPnP                  opt.Bool
 	PMP                   opt.Bool
 	PCP                   opt.Bool
-	PreferredDERP         int
+	PreferredDERP         DERPRegionID
 	LinkType              string
 	DERPLatency           map[string]float64
 	FirewallMode          string
@@ -263,8 +264,19 @@ func (src *DNSConfig) Clone() *DNSConfig {
 	}
 	if dst.Routes != nil {
 		dst.Routes = map[string][]*dnstype.Resolver{}
-		for k := range src.Routes {
-			dst.Routes[k] = append([]*dnstype.Resolver{}, src.Routes[k]...)
+		for k, sv := range src.Routes {
+			if sv == nil {
+				dst.Routes[k] = nil
+				continue
+			}
+			dst.Routes[k] = make([]*dnstype.Resolver, len(sv))
+			for i := range sv {
+				if sv[i] == nil {
+					dst.Routes[k][i] = nil
+				} else {
+					dst.Routes[k][i] = sv[i].Clone()
+				}
+			}
 		}
 	}
 	if src.FallbackResolvers != nil {
@@ -331,7 +343,7 @@ func (src *RegisterResponseAuth) Clone() *RegisterResponseAuth {
 	dst := new(RegisterResponseAuth)
 	*dst = *src
 	if dst.Oauth2Token != nil {
-		dst.Oauth2Token = ptr.To(*src.Oauth2Token)
+		dst.Oauth2Token = new(*src.Oauth2Token)
 	}
 	return dst
 }
@@ -355,7 +367,7 @@ func (src *RegisterRequest) Clone() *RegisterRequest {
 	dst.Hostinfo = src.Hostinfo.Clone()
 	dst.NodeKeySignature = append(src.NodeKeySignature[:0:0], src.NodeKeySignature...)
 	if dst.Timestamp != nil {
-		dst.Timestamp = ptr.To(*src.Timestamp)
+		dst.Timestamp = new(*src.Timestamp)
 	}
 	dst.DeviceCert = append(src.DeviceCert[:0:0], src.DeviceCert...)
 	dst.Signature = append(src.Signature[:0:0], src.Signature...)
@@ -396,7 +408,7 @@ func (src *DERPHomeParams) Clone() *DERPHomeParams {
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _DERPHomeParamsCloneNeedsRegeneration = DERPHomeParams(struct {
-	RegionScore map[int]float64
+	RegionScore map[DERPRegionID]float64
 }{})
 
 // Clone makes a deep copy of DERPRegion.
@@ -413,7 +425,7 @@ func (src *DERPRegion) Clone() *DERPRegion {
 			if src.Nodes[i] == nil {
 				dst.Nodes[i] = nil
 			} else {
-				dst.Nodes[i] = ptr.To(*src.Nodes[i])
+				dst.Nodes[i] = new(*src.Nodes[i])
 			}
 		}
 	}
@@ -422,7 +434,7 @@ func (src *DERPRegion) Clone() *DERPRegion {
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _DERPRegionCloneNeedsRegeneration = DERPRegion(struct {
-	RegionID        int
+	RegionID        DERPRegionID
 	RegionCode      string
 	RegionName      string
 	Latitude        float64
@@ -442,7 +454,7 @@ func (src *DERPMap) Clone() *DERPMap {
 	*dst = *src
 	dst.HomeParams = src.HomeParams.Clone()
 	if dst.Regions != nil {
-		dst.Regions = map[int]*DERPRegion{}
+		dst.Regions = map[DERPRegionID]*DERPRegion{}
 		for k, v := range src.Regions {
 			if v == nil {
 				dst.Regions[k] = nil
@@ -457,7 +469,7 @@ func (src *DERPMap) Clone() *DERPMap {
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _DERPMapCloneNeedsRegeneration = DERPMap(struct {
 	HomeParams         *DERPHomeParams
-	Regions            map[int]*DERPRegion
+	Regions            map[DERPRegionID]*DERPRegion
 	OmitDefaultRegions bool
 }{})
 
@@ -475,7 +487,7 @@ func (src *DERPNode) Clone() *DERPNode {
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _DERPNodeCloneNeedsRegeneration = DERPNode(struct {
 	Name             string
-	RegionID         int
+	RegionID         DERPRegionID
 	HostName         string
 	CertName         string
 	IPv4             string
@@ -497,7 +509,7 @@ func (src *SSHRule) Clone() *SSHRule {
 	dst := new(SSHRule)
 	*dst = *src
 	if dst.RuleExpires != nil {
-		dst.RuleExpires = ptr.To(*src.RuleExpires)
+		dst.RuleExpires = new(*src.RuleExpires)
 	}
 	if src.Principals != nil {
 		dst.Principals = make([]*SSHPrincipal, len(src.Principals))
@@ -534,7 +546,7 @@ func (src *SSHAction) Clone() *SSHAction {
 	*dst = *src
 	dst.Recorders = append(src.Recorders[:0:0], src.Recorders...)
 	if dst.OnRecordingFailure != nil {
-		dst.OnRecordingFailure = ptr.To(*src.OnRecordingFailure)
+		dst.OnRecordingFailure = new(*src.OnRecordingFailure)
 	}
 	return dst
 }
@@ -621,6 +633,7 @@ func (src *UserProfile) Clone() *UserProfile {
 	}
 	dst := new(UserProfile)
 	*dst = *src
+	dst.Groups = append(src.Groups[:0:0], src.Groups...)
 	return dst
 }
 
@@ -630,6 +643,7 @@ var _UserProfileCloneNeedsRegeneration = UserProfile(struct {
 	LoginName     string
 	DisplayName   string
 	ProfilePicURL string
+	Groups        []string
 }{})
 
 // Clone makes a deep copy of VIPService.

@@ -6,12 +6,15 @@
 
 ## tailscale.com/v1alpha1
 
+Package v1alpha1 documents the k8s-operator API.
 
 ### Resource Types
 - [Connector](#connector)
 - [ConnectorList](#connectorlist)
 - [DNSConfig](#dnsconfig)
 - [DNSConfigList](#dnsconfiglist)
+- [PeerRelay](#peerrelay)
+- [PeerRelayList](#peerrelaylist)
 - [ProxyClass](#proxyclass)
 - [ProxyClassList](#proxyclasslist)
 - [ProxyGroup](#proxygroup)
@@ -349,6 +352,7 @@ _Validation:_
 
 _Appears in:_
 - [ConnectorSpec](#connectorspec)
+- [PeerRelaySpec](#peerrelayspec)
 - [ProxyGroupSpec](#proxygroupspec)
 
 
@@ -483,6 +487,9 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#toleration-v1-core) array_ | If specified, applies tolerations to the pods deployed by the DNSConfig resource. |  |  |
+| `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#affinity-v1-core)_ | If specified, applies affinity rules to the pods deployed by the DNSConfig resource. |  |  |
+| `nodeSelector` _object (keys:string, values:string)_ | If specified, applies node selector rules to the pods deployed by the DNSConfig resource. |  |  |
+| `imagePullSecrets` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#localobjectreference-v1-core) array_ | Nameserver Pod's image pull Secrets.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodSpec |  |  |
 
 
 #### NameserverService
@@ -532,6 +539,156 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `ports` _[PortRange](#portrange) array_ | The port ranges from which the operator will select NodePorts for the Services.<br />You must ensure that firewall rules allow UDP ingress traffic for these ports<br />to the node's external IPs.<br />The ports must be in the range of service node ports for the cluster (default `30000-32767`).<br />See https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport. |  | MinItems: 1 <br /> |
 | `selector` _object (keys:string, values:string)_ | A selector which will be used to select the node's that will have their `ExternalIP`'s advertised<br />by the ProxyGroup as Static Endpoints. |  |  |
+
+
+#### PeerRelay
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelayList](#peerrelaylist)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `PeerRelay` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[PeerRelaySpec](#peerrelayspec)_ | Spec describes the desired state of the PeerRelay.<br />More info:<br />https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status |  |  |
+| `status` _[PeerRelayStatus](#peerrelaystatus)_ | Status describes the status of the PeerRelay. This is set<br />and managed by the Tailscale operator. |  |  |
+
+
+#### PeerRelayAWS
+
+
+
+PeerRelayAWS contains AWS-specific configuration for a PeerRelay.
+
+
+
+_Appears in:_
+- [PeerRelaySpec](#peerrelayspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `elasticIPs` _[PeerRelayAWSElasticIP](#peerrelayawselasticip) array_ | ElasticIPs pins each replica to a specific AWS EIP allocation and subnet. Only meaningful when Network Load<br />Balancers are provisioned by the AWS Load Balancer Controller. ElasticIPs supplies one allocation-subnet pair<br />per replica: replica N uses ElasticIPs[N]. The list must be at least as long as spec.replicas so every replica<br />has a distinct EIP; extra entries are permitted so that scale-up doesn't immediately trip validation.<br />Pinning a subnet enables only that subnet's availability zone on the replica's load balancer, and a Network<br />Load Balancer only forwards to targets in an enabled zone. Nothing constrains the scheduler to place the<br />replica's pod in that zone, so a pod scheduled elsewhere, including after a reschedule, becomes unreachable<br />on its Elastic IP while still appearing healthy.<br />Every replica of a PeerRelay shares one pod template, so a ProxyClass referenced by spec.proxyClass can<br />confine the pods to a zone but cannot place different replicas in different zones. To use this field<br />safely, name subnets in a single availability zone and pin the pods to that same zone with a ProxyClass<br />setting spec.statefulSet.pod.nodeSelector to topology.kubernetes.io/zone. Note that this trades the zone<br />redundancy that running several replicas would otherwise buy. Spreading replicas across zones with their<br />own Elastic IPs needs a per-replica scheduling constraint that neither PeerRelay nor ProxyClass can<br />currently express.<br />When set, the reconciler stamps<br />service.beta.kubernetes.io/aws-load-balancer-eip-allocations and<br />service.beta.kubernetes.io/aws-load-balancer-subnets on each per-replica Service, overriding any values in<br />spec.service.annotations. |  | MinItems: 1 <br /> |
+
+
+#### PeerRelayAWSElasticIP
+
+
+
+PeerRelayAWSElasticIP pairs an EIP allocation with the subnet it is attached to.
+
+
+
+_Appears in:_
+- [PeerRelayAWS](#peerrelayaws)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `allocationID` _string_ | AllocationID is the AWS EIP allocation ID (e.g. eipalloc-0123abcd) whose public IP this replica is reachable<br />on. Stamped as service.beta.kubernetes.io/aws-load-balancer-eip-allocations on the replica's Service. |  | Pattern: `^eipalloc-[0-9a-f]+$` <br /> |
+| `subnetID` _string_ | SubnetID is the AWS subnet the replica's load balancer is provisioned in (e.g. subnet-0123abcd). It must be<br />a public subnet, and no two replicas may name subnets in the same availability zone, since a load balancer<br />accepts only one Elastic IP per zone. A standard VPC Elastic IP is regional rather than zonal, so it takes<br />the zone of whichever subnet it is paired with here. Stamped as<br />service.beta.kubernetes.io/aws-load-balancer-subnets on the replica's Service. |  | Pattern: `^subnet-[0-9a-f]+$` <br /> |
+
+
+#### PeerRelayEndpoint
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelayStatus](#peerrelaystatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `replica` _integer_ | Replica is the zero-based index of the peer relay replica this endpoint targets. |  |  |
+| `address` _string_ | Address is the public IP or hostname the cloud has allocated for this replica's LoadBalancer Service, or<br />an address supplied via spec.staticEndpoints. Peers reach this relay by connecting to Address:Port over UDP. |  |  |
+| `port` _integer_ | Port is the UDP port the peer relay listens on. |  |  |
+
+
+#### PeerRelayList
+
+
+
+
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `PeerRelayList` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#listmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `items` _[PeerRelay](#peerrelay) array_ |  |  |  |
+
+
+#### PeerRelayService
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelaySpec](#peerrelayspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `annotations` _object (keys:string, values:string)_ | Annotations to apply to the LoadBalancer service. Any annotations that conflict with those used by known<br />cloud providers to ensure IP addresses rather than DNS names are ignored. |  |  |
+| `port` _integer_ | Port is the UDP port each peer relay replica listens on and that its LoadBalancer Service exposes<br />externally. The two are always equal: the relay advertises address:port to peers, so the load balancer<br />must forward without rewriting the port. Changing the port on an existing PeerRelay briefly interrupts<br />relay traffic while the load balancer updates. Defaults to 41641. | 41641 | Maximum: 65535 <br />Minimum: 1 <br /> |
+
+
+#### PeerRelaySpec
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelay](#peerrelay)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `tags` _[Tags](#tags)_ | Tags that the Tailscale node will be tagged with.<br />Defaults to [tag:k8s].<br />To autoapprove the device defined by a PeerRelay,<br />you can configure Tailscale ACLs to give these tags the necessary<br />permissions.<br />See https://tailscale.com/kb/1337/acl-syntax#autoapprovers.<br />If you specify custom tags here, you must also make the operator an owner of these tags.<br />See  https://tailscale.com/kb/1236/kubernetes-operator/#setting-up-the-kubernetes-operator.<br />Tags cannot be changed once a PeerRelay node has been created.<br />Tag values must be in form ^tag:[a-zA-Z][a-zA-Z0-9-]*$. |  | Pattern: `^tag:[a-zA-Z][a-zA-Z0-9-]*$` <br />Type: string <br /> |
+| `hostnamePrefix` _[HostnamePrefix](#hostnameprefix)_ | HostnamePrefix specifies the hostname prefix for each<br />replica. Each device will have the integer number<br />from its StatefulSet pod appended to this prefix to form the full hostname.<br />HostnamePrefix can contain lower case letters, numbers and dashes, it<br />must not start with a dash and must be between 1 and 62 characters long. |  | Pattern: `^[a-z0-9][a-z0-9-]{0,61}$` <br />Type: string <br /> |
+| `proxyClass` _string_ | ProxyClass is the name of the ProxyClass custom resource that<br />contains configuration options that should be applied to the<br />resources created for this PeerRelay. If unset, the operator will<br />create resources with the default configuration. |  |  |
+| `replicas` _integer_ | Replicas specifies how many devices to create. Set this to enable<br />high availability for peer relays.<br />https://tailscale.com/kb/1115/high-availability. Defaults to 1. | 1 | Minimum: 0 <br /> |
+| `tailnet` _string_ | Tailnet specifies the tailnet this PeerRelay should join. If blank, the default tailnet is used. When set, this<br />name must match that of a valid Tailnet resource. This field is immutable and cannot be changed once set. |  |  |
+| `service` _[PeerRelayService](#peerrelayservice)_ | Service contains configuration values to modify the LoadBalancer service used to expose the peer relay. |  |  |
+| `staticEndpoints` _string array_ | StaticEndpoints is an optional list of address:port pairs on which every replica of this PeerRelay is<br />reachable from outside the cluster, for example the public side of a NAT or firewall in front of the<br />cluster. These supplement the endpoints discovered from each replica's LoadBalancer Service: they are<br />added to every replica's entries in status.endpoints and advertised to peers alongside them. If an entry<br />names an address a replica's load balancer already provides, the entry's port takes precedence for that<br />address. Each address may appear at most once across all entries.<br />Entries take the form accepted by Go's net/netip.ParseAddrPort, e.g. 203.0.113.1:41641. IPv6<br />addresses must be enclosed in brackets, e.g. [2001:db8::1]:41641. |  | items:Pattern: ^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-fA-F:.]+\]):\d{1,5}$ <br /> |
+| `aws` _[PeerRelayAWS](#peerrelayaws)_ | AWS contains configuration for pinning each replica to a specific AWS Elastic IP and subnet. Only meaningful<br />when running on EKS with the AWS Load Balancer Controller. When set, the per-replica values override any<br />aws-load-balancer-eip-allocations or aws-load-balancer-subnets values supplied via spec.service.annotations.<br />Leave this unset unless the peer relays must be reachable on addresses you control. Pinning a subnet<br />confines a replica's load balancer to that subnet's availability zone, and an AWS Network Load Balancer<br />only forwards to targets in a zone that is enabled on it, so a replica whose pod is scheduled into any<br />other zone stops receiving traffic. Setting this field therefore also requires pinning the pods to the<br />matching zone with a ProxyClass, as described on ElasticIPs. Without this field the AWS Load Balancer<br />Controller instead provisions each load balancer across every zone it discovers, and the operator turns on<br />cross-zone load balancing so the replica is reachable wherever it happens to be scheduled, with no<br />scheduling constraints needed. |  |  |
+
+
+#### PeerRelayStatus
+
+
+
+
+
+
+
+_Appears in:_
+- [PeerRelay](#peerrelay)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#condition-v1-meta) array_ |  |  |  |
+| `endpoints` _[PeerRelayEndpoint](#peerrelayendpoint) array_ | Endpoints lists the public address:port pairs each peer relay replica is reachable on. Entries appear as the<br />underlying cloud provisions each Service. A replica has one entry per address its LoadBalancer Service was<br />given, which is usually one, but a load balancer spanning several availability zones has an address in each<br />and every one of them is listed. Entries from spec.staticEndpoints are listed for every replica in addition<br />to the load balancer addresses. |  |  |
 
 
 #### Pod
@@ -1231,6 +1388,7 @@ _Validation:_
 
 _Appears in:_
 - [ConnectorSpec](#connectorspec)
+- [PeerRelaySpec](#peerrelayspec)
 - [ProxyGroupSpec](#proxygroupspec)
 - [RecorderSpec](#recorderspec)
 
@@ -1271,7 +1429,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `secretName` _string_ | The name of the secret containing the OAuth credentials. This secret must contain two fields "client_id" and<br />"client_secret". |  |  |
+| `secretName` _string_ | The name of the secret containing the credentials used to authenticate with this Tailnet. The secret must always<br />contain a "client_id" field. To authenticate with a static OAuth client, also set "client_secret". To authenticate<br />via workload identity federation, set "audience" to the audience value expected by the Tailscale OAuth<br />client; the operator will mint a ServiceAccount token for itself with that audience and exchange it for an API<br />token. "client_secret" and "audience" are mutually exclusive. |  |  |
 
 
 #### TailnetDevice
@@ -1326,7 +1484,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `loginUrl` _string_ | URL of the control plane to be used by all resources managed by the operator using this Tailnet. |  |  |
-| `credentials` _[TailnetCredentials](#tailnetcredentials)_ | Denotes the location of the OAuth credentials to use for authenticating with this Tailnet. |  |  |
+| `credentials` _[TailnetCredentials](#tailnetcredentials)_ | Denotes the location of the credentials to use for authenticating with this Tailnet. |  |  |
 
 
 #### TailnetStatus

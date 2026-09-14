@@ -35,9 +35,12 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -103,7 +106,7 @@ func (s *peerAPIServer) listen(ip netip.Addr, tunIfIndex int) (ln net.Listener, 
 	// deterministic that people will bake this into clients.
 	// We try a few times just in case something's already
 	// listening on that port (on all interfaces, probably).
-	for try := uint8(0); try < 5; try++ {
+	for try := range uint8(5) {
 		a16 := ip.As16()
 		hashData := a16[len(a16)-3:]
 		hashData[0] += try
@@ -192,7 +195,7 @@ func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 		c.Close()
 		return
 	}
-	nm := pln.lb.NetMap()
+	nm := pln.lb.NetMapNoPeers()
 	if nm == nil || !nm.SelfNode.Valid() {
 		logf("peerapi: no netmap")
 		c.Close()
@@ -263,10 +266,16 @@ func (h *peerAPIHandler) isAddressValid(addr netip.Addr) bool {
 	if !addr.IsValid() {
 		return false
 	}
-	v4MasqAddr, hasMasqV4 := h.peerNode.SelfNodeV4MasqAddrForThisPeer().GetOk()
-	v6MasqAddr, hasMasqV6 := h.peerNode.SelfNodeV6MasqAddrForThisPeer().GetOk()
-	if hasMasqV4 || hasMasqV6 {
-		return addr == v4MasqAddr || addr == v6MasqAddr
+	// A masquerade address for a family, if set, replaces this node's
+	// native address of that family from the peer's point of view.
+	// A masquerade address for one family says nothing about the other
+	// family, so the other family still falls through to the self
+	// address check below.
+	if v4MasqAddr, ok := h.peerNode.SelfNodeV4MasqAddrForThisPeer().GetOk(); ok && addr.Is4() {
+		return addr == v4MasqAddr
+	}
+	if v6MasqAddr, ok := h.peerNode.SelfNodeV6MasqAddrForThisPeer().GetOk(); ok && addr.Is6() {
+		return addr == v6MasqAddr
 	}
 	pfx := netip.PrefixFrom(addr, addr.BitLen())
 	return views.SliceContains(h.selfNode.Addresses(), pfx)
@@ -578,7 +587,7 @@ func (h *peerAPIHandler) CanDebug() bool { return h.canDebug() }
 // canDebug reports whether h can debug this node (goroutines, metrics,
 // magicsock internal state, etc).
 func (h *peerAPIHandler) canDebug() bool {
-	if !h.selfNode.HasCap(tailcfg.CapabilityDebug) {
+	if !h.selfNode.HasCap(nodecap.Debug) {
 		// This node does not expose debug info.
 		return false
 	}
@@ -586,17 +595,17 @@ func (h *peerAPIHandler) canDebug() bool {
 		// Unsigned peers can't debug.
 		return false
 	}
-	return h.isSelf || h.peerHasCap(tailcfg.PeerCapabilityDebugPeer)
+	return h.isSelf || h.peerHasCap(peercap.DebugPeer)
 }
 
 var allowSelfIngress = envknob.RegisterBool("TS_ALLOW_SELF_INGRESS")
 
 // canIngress reports whether h can send ingress requests to this node.
 func (h *peerAPIHandler) canIngress() bool {
-	return h.peerHasCap(tailcfg.PeerCapabilityIngress) || (allowSelfIngress() && h.isSelf)
+	return h.peerHasCap(peercap.Ingress) || (allowSelfIngress() && h.isSelf)
 }
 
-func (h *peerAPIHandler) peerHasCap(wantCap tailcfg.PeerCapability) bool {
+func (h *peerAPIHandler) peerHasCap(wantCap peercap.Cap) bool {
 	return h.PeerCaps().HasCapability(wantCap)
 }
 
@@ -674,25 +683,106 @@ func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Reques
 	dh.ServeHTTP(w, r)
 }
 
-func (h *peerAPIHandler) replyToDNSQueries() bool {
+// DNSNameFilter allows extensions to conditionally allow PeerAPI DNS queries
+// based on the name being queried, in addition to the source of the query. It
+// is used by [HookReplyToDNSQueries].
+type DNSNameFilter func(name string) (allowed bool)
+
+// HookReplyToDNSQueries allows extensions to register a willingness to allow
+// handling PeerAPI DNS queries for the peer making this request, optionally
+// depending on the name being queried. The [http.Request.Body] must not be read
+// by the handler.
+// When sourceAllowed is false, the query is disallowed and nameAllowed is
+// ignored (recommendation: nameAllowed should be nil in this case).
+// When sourceAllowed is true, the peer is permitted to send queries but the
+// final decision depends on the name being queried. When nameAllowed is nil,
+// all names are allowed. Otherwise, nameAllowed is called after parsing the
+// query to determine if it should be accepted.
+// While separating the decisions complicates this hook, it permits optimizing
+// the common case where all names are allowed for exit nodes and appc.
+var HookReplyToDNSQueries = feature.Hooks[func(PeerAPIHandler, *http.Request) (sourceAllowed bool, nameAllowed DNSNameFilter)]{
+	offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet,
+}
+
+// isPeerAPIDNSAllowed determines if any of the default or extension hooks
+// permit PeerAPI DNS lookups for the current request.
+// nameAllowed will never be nil when sourceAllowed is true, as required by
+// [tailscale.com/net/dns/resolver.Resolver.HandlePeerDNSQuery], so it is not
+// quite the same as a [DNSNameFilter].
+func (h *peerAPIHandler) isPeerAPIDNSAllowed(r *http.Request) (sourceAllowed bool, nameAllowed func(string) bool) {
 	if !buildfeatures.HasDNS {
-		return false
+		return false, nil
 	}
-	if h.isSelf {
+	if h.IsSelfUntagged() {
 		// If the peer is owned by the same user, just allow it
 		// without further checks.
-		return true
-	}
-	b := h.ps.b
-	if !b.OfferingExitNode() && !b.OfferingAppConnector() {
-		// If we're not an exit node or app connector, there's
-		// no point to being a DNS server for somebody.
-		return false
+		return true, h.allowExitNodeDNSProxyToServeName
 	}
 	if !h.remoteAddr.IsValid() {
 		// This should never be the case if the peerAPIHandler
 		// was wired up correctly, but just in case.
+		return false, nil
+	}
+
+	nameFilters := make([]DNSNameFilter, 0, len(HookReplyToDNSQueries))
+	for _, hook := range HookReplyToDNSQueries {
+		allow, allowedName := hook(h, r)
+		if !allow {
+			continue
+		}
+		if allowedName == nil {
+			// Allow all names by default (still subject to names restricted by
+			// the netmap).
+			return true, h.allowExitNodeDNSProxyToServeName
+		}
+		nameFilters = append(nameFilters, allowedName)
+	}
+
+	if len(nameFilters) == 0 {
+		return false, nil
+	}
+
+	return true, func(name string) bool {
+		// Always filter out names restricted by the netmap.
+		if !h.allowExitNodeDNSProxyToServeName(name) {
+			return false
+		}
+		// Now, only allow names permitted by at least one extension.
+		for _, f := range nameFilters {
+			if f(name) {
+				return true
+			}
+		}
 		return false
+	}
+}
+
+// exitNodeDNSFilterForTest overrides
+// peerAPIHandler.allowExitNodeDNSProxyToServeName if set during test execution.
+var exitNodeDNSFilterForTest func(name string) bool
+
+func (h *peerAPIHandler) allowExitNodeDNSProxyToServeName(name string) bool {
+	if testenv.InTest() && exitNodeDNSFilterForTest != nil {
+		return exitNodeDNSFilterForTest(name)
+	}
+	return h.ps.b.allowExitNodeDNSProxyToServeName(name)
+}
+
+// offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet is run as part of
+// [HookReplyToDNSQueries] and handles our legacy PeerAPI DNS acceptance
+// criteria:
+//   - When a node is advertising an exit node it will accept DNS queries
+//     from peers that have access to autogroup:internet.
+//   - When a node is advertising an app connector, it will accept DNS queries
+//     to peers that have access to a relevant app.
+//
+// Further details about how these are accomplished are in inline comments.
+func offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet(h PeerAPIHandler, _ *http.Request) (bool, DNSNameFilter) {
+	b := h.LocalBackend()
+	if !b.OfferingExitNode() && !b.OfferingAppConnector() {
+		// If we're not an exit node or app connector, this hook
+		// doesn't apply.
+		return false, nil
 	}
 	// Otherwise, we're an exit node but the peer is not us, so
 	// we need to check if they're allowed access to the internet.
@@ -709,21 +799,21 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 	// in LocalBackend).
 	f := b.currentNode().filter()
 	if f == nil {
-		return false
+		return false, nil
 	}
 	// Note: we check TCP here because the Filter type already had
 	// a CheckTCP method (for unit tests), but it's pretty
 	// arbitrary. DNS runs over TCP and UDP, so sure... we check
 	// TCP.
 	dstIP := netaddr.IPv4(0, 0, 0, 0)
-	remoteIP := h.remoteAddr.Addr()
+	remoteIP := h.RemoteAddr().Addr()
 	if remoteIP.Is6() {
 		// autogroup:internet for IPv6 is defined to start with 2000::/3,
 		// so use 2000::0 as the probe "the internet" address.
 		dstIP = netip.MustParseAddr("2000::")
 	}
 	verdict := f.CheckTCP(remoteIP, dstIP, 53)
-	return verdict == filter.Accept
+	return verdict == filter.Accept, nil
 }
 
 // handleDNSQuery implements a DoH server (RFC 8484) over the peerapi.
@@ -733,7 +823,8 @@ func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "DNS not wired up", http.StatusNotImplemented)
 		return
 	}
-	if !h.replyToDNSQueries() {
+	sourceAllowed, nameAllowed := h.isPeerAPIDNSAllowed(r)
+	if !sourceAllowed {
 		http.Error(w, "DNS access denied", http.StatusForbidden)
 		return
 	}
@@ -757,7 +848,7 @@ func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) 
 
 	ctx, cancel := context.WithTimeout(r.Context(), arbitraryTimeout)
 	defer cancel()
-	res, err := h.ps.resolver.HandlePeerDNSQuery(ctx, q, h.remoteAddr, h.ps.b.allowExitNodeDNSProxyToServeName)
+	res, err := h.ps.resolver.HandlePeerDNSQuery(ctx, q, h.remoteAddr, nameAllowed)
 	if err != nil {
 		h.logf("handleDNS fwd error: %v", err)
 		if err := ctx.Err(); err != nil {

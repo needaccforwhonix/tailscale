@@ -5,9 +5,11 @@ package controlclient
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,6 +126,138 @@ func fakeEndpoints(ports ...uint16) (ret []tailcfg.Endpoint) {
 		})
 	}
 	return
+}
+
+func TestParseRateLimitError(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		retryAfter string // Retry-After header value
+		wantMsg    string
+		wantMin    time.Duration // minimum expected retryAfter
+		wantMax    time.Duration // maximum expected retryAfter
+	}{
+		{
+			name:       "retry-after-seconds",
+			statusCode: 429,
+			body:       "too many requests",
+			retryAfter: "30",
+			wantMsg:    "too many requests",
+			wantMin:    30 * time.Second,
+			wantMax:    30 * time.Second,
+		},
+		{
+			name:       "no-retry-after-header",
+			statusCode: 429,
+			body:       "slow down",
+			retryAfter: "",
+			wantMsg:    "slow down",
+			wantMin:    5 * time.Second,
+			wantMax:    10 * time.Second,
+		},
+		{
+			name:       "unparseable-retry-after",
+			statusCode: 429,
+			body:       "rate limited",
+			retryAfter: "not-a-number",
+			wantMsg:    "rate limited",
+			wantMin:    5 * time.Second,
+			wantMax:    10 * time.Second,
+		},
+		{
+			name:       "empty-body",
+			statusCode: 429,
+			body:       "",
+			retryAfter: "5",
+			wantMsg:    "",
+			wantMin:    5 * time.Second,
+			wantMax:    5 * time.Second,
+		},
+		{
+			name:       "body-with-whitespace",
+			statusCode: 429,
+			body:       "  too many requests  \n",
+			retryAfter: "10",
+			wantMsg:    "too many requests",
+			wantMin:    10 * time.Second,
+			wantMax:    10 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			if tt.retryAfter != "" {
+				rec.Header().Set("Retry-After", tt.retryAfter)
+			}
+			rec.WriteHeader(tt.statusCode)
+			rec.Body.WriteString(tt.body)
+			res := rec.Result()
+
+			err := parseRateLimitError(res)
+			if err == nil {
+				t.Fatal("expected non-nil error")
+			}
+
+			var rle *rateLimitError
+			if !errors.As(err, &rle) {
+				t.Fatalf("error is not a *rateLimitError: %T", err)
+			}
+			if rle.msg != tt.wantMsg {
+				t.Errorf("msg = %q, want %q", rle.msg, tt.wantMsg)
+			}
+			if rle.retryAfter < tt.wantMin || rle.retryAfter > tt.wantMax {
+				t.Errorf("retryAfter = %v, want between %v and %v", rle.retryAfter, tt.wantMin, tt.wantMax)
+			}
+
+			// Verify the Error() string contains useful information.
+			errStr := err.Error()
+			if !strings.Contains(errStr, "rate limited") {
+				t.Errorf("Error() = %q, want it to contain 'rate limited'", errStr)
+			}
+		})
+	}
+}
+
+func TestIsRateLimitedResponse(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		retryAfter string
+		want       bool
+	}{
+		{name: "429-no-header", statusCode: 429, want: true},
+		{name: "429-with-header", statusCode: 429, retryAfter: "30", want: true},
+		{name: "503-with-header", statusCode: 503, retryAfter: "30", want: true},
+		{name: "503-no-header", statusCode: 503, want: false},
+		{name: "500-with-header", statusCode: 500, retryAfter: "30", want: false},
+		{name: "200", statusCode: 200, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			if tt.retryAfter != "" {
+				rec.Header().Set("Retry-After", tt.retryAfter)
+			}
+			rec.WriteHeader(tt.statusCode)
+
+			if got := isRateLimitedResponse(rec.Result()); got != tt.want {
+				t.Errorf("shouldHonorRetryAfter; got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRateLimitErrorIsError(t *testing.T) {
+	err := &rateLimitError{msg: "test", retryAfter: 5 * time.Second}
+	var target *rateLimitError
+	if !errors.As(err, &target) {
+		t.Fatal("errors.As should match *rateLimitError")
+	}
+	if target.retryAfter != 5*time.Second {
+		t.Errorf("retryAfter = %v, want 5s", target.retryAfter)
+	}
 }
 
 func TestTsmpPing(t *testing.T) {

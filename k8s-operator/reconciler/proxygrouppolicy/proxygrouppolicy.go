@@ -24,7 +24,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/set"
 )
 
@@ -189,7 +188,7 @@ const (
 	// Empty allowlist behavior:
 	//   If the list is empty, any present annotation will fail membership,
 	//   effectively acting as "deny-all".
-	ingressCEL = `request.kind.kind != "Ingress" || !("tailscale.com/proxy-group" in object.metadata.annotations) || object.metadata.annotations["tailscale.com/proxy-group"] in [%s]`
+	ingressCEL = `request.kind.kind != "Ingress" || !has(object.metadata.annotations) || !("tailscale.com/proxy-group" in object.metadata.annotations) || object.metadata.annotations["tailscale.com/proxy-group"] in [%s]`
 
 	// ingressServiceCEL enforces proxy-group annotation rules for Services
 	// that are using the tailscale load balancer.
@@ -203,7 +202,7 @@ const (
 	//   - If annotation is present → must be in allowlist
 	//
 	// This makes ingress policy apply ONLY to tailscale Services.
-	ingressServiceCEL = `request.kind.kind != "Service" || !((has(object.spec.loadBalancerClass) && object.spec.loadBalancerClass == "tailscale") || ("tailscale.com/expose" in object.metadata.annotations && object.metadata.annotations["tailscale.com/expose"] == "true")) || (!("tailscale.com/proxy-group" in object.metadata.annotations) || object.metadata.annotations["tailscale.com/proxy-group"] in [%s])`
+	ingressServiceCEL = `request.kind.kind != "Service" || !((has(object.spec.loadBalancerClass) && object.spec.loadBalancerClass == "tailscale") || (has(object.metadata.annotations) && "tailscale.com/expose" in object.metadata.annotations && object.metadata.annotations["tailscale.com/expose"] == "true")) || (!has(object.metadata.annotations) || !("tailscale.com/proxy-group" in object.metadata.annotations) || object.metadata.annotations["tailscale.com/proxy-group"] in [%s])`
 	// egressCEL enforces proxy-group annotation rules for Services that
 	// are NOT using the tailscale load balancer.
 	//
@@ -221,7 +220,7 @@ const (
 	//
 	// This expression is mutually exclusive with ingressServiceCEL,
 	// preventing policy conflicts.
-	egressCEL = `((has(object.spec.loadBalancerClass) && object.spec.loadBalancerClass == "tailscale") || ("tailscale.com/expose" in object.metadata.annotations && object.metadata.annotations["tailscale.com/expose"] == "true")) || !("tailscale.com/proxy-group" in object.metadata.annotations) || object.metadata.annotations["tailscale.com/proxy-group"] in [%s]`
+	egressCEL = `((has(object.spec.loadBalancerClass) && object.spec.loadBalancerClass == "tailscale") || (has(object.metadata.annotations) && "tailscale.com/expose" in object.metadata.annotations && object.metadata.annotations["tailscale.com/expose"] == "true")) || !has(object.metadata.annotations) || !("tailscale.com/proxy-group" in object.metadata.annotations) || object.metadata.annotations["tailscale.com/proxy-group"] in [%s]`
 )
 
 func (r *Reconciler) generateIngressPolicy(ctx context.Context, namespace string, names set.Set[string]) (*admr.ValidatingAdmissionPolicy, error) {
@@ -243,7 +242,7 @@ func (r *Reconciler) generateIngressPolicy(ctx context.Context, namespace string
 			ResourceVersion: policy.ResourceVersion,
 		},
 		Spec: admr.ValidatingAdmissionPolicySpec{
-			FailurePolicy: ptr.To(admr.Fail),
+			FailurePolicy: new(admr.Fail),
 			MatchConstraints: &admr.MatchResources{
 				// The operator allows ingress via Ingress resources & Service resources (that use the "tailscale" load
 				// balancer class), so we have two resource rules here with multiple validation expressions that attempt
@@ -304,7 +303,7 @@ func (r *Reconciler) generateEgressPolicy(ctx context.Context, namespace string,
 			ResourceVersion: policy.ResourceVersion,
 		},
 		Spec: admr.ValidatingAdmissionPolicySpec{
-			FailurePolicy: ptr.To(admr.Fail),
+			FailurePolicy: new(admr.Fail),
 			MatchConstraints: &admr.MatchResources{
 				ResourceRules: []admr.NamedRuleWithOperations{
 					{

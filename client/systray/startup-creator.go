@@ -3,7 +3,6 @@
 
 //go:build cgo || !darwin
 
-// Package systray provides a minimal Tailscale systray application.
 package systray
 
 import (
@@ -122,7 +121,7 @@ func installFreedesktop() error {
 	}
 
 	autostartDir := filepath.Join(configDir, "autostart")
-	if err := os.MkdirAll(autostartDir, 0o644); err != nil {
+	if err := os.MkdirAll(autostartDir, 0o755); err != nil {
 		return fmt.Errorf("failed creating freedesktop autostart dir: %w", err)
 	}
 

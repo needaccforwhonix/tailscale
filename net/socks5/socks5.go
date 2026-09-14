@@ -15,15 +15,18 @@ package socks5
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"slices"
 	"strconv"
 	"time"
 
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 )
 
@@ -129,7 +132,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		}
 		go func() {
 			defer c.Close()
-			conn := &Conn{logf: s.Logf, clientConn: c, srv: s}
+			conn := &Conn{clientConn: c, srv: s}
 			err := conn.Run()
 			if err != nil {
 				s.logf("client connection failed: %v", err)
@@ -144,13 +147,22 @@ type Conn struct {
 	// The struct is filled by each of the internal
 	// methods in turn as the transaction progresses.
 
-	logf       logger.Logf
 	srv        *Server
 	clientConn net.Conn
 	request    *request
 
-	udpClientAddr  net.Addr
+	// udpClientAddr is the address the client sends its UDP datagrams from.
+	// The goroutine reading from the client writes it, and a goroutine per
+	// target reads it to address the responses, so it needs a lock.
+	udpClientAddr syncs.MutexValue[net.Addr]
+
 	udpTargetConns map[socksAddr]net.Conn
+}
+
+// logf logs to the server's logger, which falls back to the standard logger
+// when Server.Logf is nil.
+func (c *Conn) logf(format string, args ...any) {
+	c.srv.logf(format, args...)
 }
 
 // Run starts the new connection.
@@ -172,7 +184,14 @@ func (c *Conn) Run() error {
 	}
 
 	user, pwd, err := parseClientAuth(c.clientConn)
-	if err != nil || user != c.srv.Username || pwd != c.srv.Password {
+	// Compare both credentials in constant time. The listener is reachable by
+	// any local process, so a data-dependent comparison would let one recover
+	// the username or password a byte at a time by timing the reject. Evaluate
+	// both halves unconditionally so the username result doesn't gate whether
+	// the password is examined.
+	userMatch := subtle.ConstantTimeCompare([]byte(user), []byte(c.srv.Username))
+	pwdMatch := subtle.ConstantTimeCompare([]byte(pwd), []byte(c.srv.Password))
+	if err != nil || userMatch != 1 || pwdMatch != 1 {
 		c.clientConn.Write([]byte{1, 1}) // auth error
 		return err
 	}
@@ -402,7 +421,7 @@ func (c *Conn) handleUDPRequest(
 	if err != nil {
 		return fmt.Errorf("read from client: %w", err)
 	}
-	c.udpClientAddr = addr
+	c.udpClientAddr.Store(addr)
 	req, data, err := parseUDPRequest(buf[:n])
 	if err != nil {
 		return fmt.Errorf("parse udp request: %w", err)
@@ -442,7 +461,7 @@ func (c *Conn) handleUDPResponse(
 	}
 	data := append(pkt, buf[:n]...)
 	// use addr from client to send back
-	nn, err := clientConn.WriteTo(data, c.udpClientAddr)
+	nn, err := clientConn.WriteTo(data, c.udpClientAddr.Load())
 	if err != nil {
 		return fmt.Errorf("write to client: %w", err)
 	}
@@ -488,10 +507,8 @@ func parseClientGreeting(r io.Reader, authMethod byte) error {
 	if err != nil {
 		return fmt.Errorf("could not read methods")
 	}
-	for _, m := range methods {
-		if m == authMethod {
-			return nil
-		}
+	if slices.Contains(methods, authMethod) {
+		return nil
 	}
 	return fmt.Errorf("no acceptable auth methods")
 }
