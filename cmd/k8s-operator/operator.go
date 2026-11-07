@@ -10,7 +10,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -59,6 +58,7 @@ import (
 	"tailscale.com/k8s-operator/reconciler/peerrelay"
 	"tailscale.com/k8s-operator/reconciler/proxyclass"
 	"tailscale.com/k8s-operator/reconciler/proxygrouppolicy"
+	"tailscale.com/k8s-operator/reconciler/recorder"
 	"tailscale.com/k8s-operator/reconciler/tailnet"
 	"tailscale.com/k8s-operator/reconciler/tailscaled"
 	"tailscale.com/k8s-operator/tsclient"
@@ -151,6 +151,9 @@ func main() {
 		}()
 	}
 
+	// Read before the log upload tee below, which lowers the logger's level to debug.
+	logLevel := zlog.Level()
+
 	// Operator log uploads can be opted-out using the "TS_NO_LOGS_NO_SUPPORT" environment variable.
 	if !envknob.NoLogsNoSupport() {
 		zlog = zlog.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
@@ -160,6 +163,7 @@ func main() {
 
 	runReconcilers(reconcilerOpts{
 		log:                           zlog,
+		logLevel:                      logLevel,
 		tsServer:                      s,
 		tsClient:                      tsc,
 		tailscaleNamespace:            tsNamespace,
@@ -322,7 +326,7 @@ func runReconcilers(opts reconcilerOpts) {
 	// ServiceMonitor CRD applied after some of our resources that define ServiceMonitor creation. This selector
 	// ensures that we only watch the ServiceMonitor CRD and that we don't cache full contents of it.
 	serviceMonitorSelector := cache.ByObject{
-		Field:     fields.SelectorFromSet(fields.Set{"metadata.name": serviceMonitorCRD}),
+		Field:     fields.SelectorFromSet(fields.Set{"metadata.name": tailscaled.ServiceMonitorCRD}),
 		Transform: crdTransformer(startlog),
 	}
 
@@ -541,12 +545,14 @@ func runReconcilers(opts reconcilerOpts) {
 	// If a ProxyClassChanges, enqueue all Connectors that have
 	// .spec.proxyClass set to the name of this ProxyClass.
 	proxyClassFilterForConnector := handler.EnqueueRequestsFromMapFunc(proxyClassHandlerForConnector(mgr.GetClient(), startlog))
+	nodeFilterForConnector := handler.EnqueueRequestsFromMapFunc(nodeHandlerForConnector(mgr.GetClient(), startlog))
 	err = builder.ControllerManagedBy(mgr).
 		For(&tsapi.Connector{}).
 		Named("connector-reconciler").
 		Watches(&appsv1.StatefulSet{}, connectorFilter).
 		Watches(&corev1.Secret{}, connectorFilter).
 		Watches(&tsapi.ProxyClass{}, proxyClassFilterForConnector).
+		Watches(&corev1.Node{}, nodeFilterForConnector).
 		Complete(&ConnectorReconciler{
 			ssr:      ssr,
 			recorder: eventRecorder,
@@ -572,12 +578,14 @@ func runReconcilers(opts reconcilerOpts) {
 	}
 
 	egressSvcFilter := handler.EnqueueRequestsFromMapFunc(egressSvcsHandler)
+	egressSvcFromEpsFilter := handler.EnqueueRequestsFromMapFunc(egressSvcFromEps)
 	egressProxyGroupFilter := handler.EnqueueRequestsFromMapFunc(egressSvcsFromEgressProxyGroup(mgr.GetClient(), opts.log))
 	err = builder.
 		ControllerManagedBy(mgr).
 		Named("egress-svcs-reconciler").
 		Watches(&corev1.Service{}, egressSvcFilter).
 		Watches(&tsapi.ProxyGroup{}, egressProxyGroupFilter).
+		Watches(&discoveryv1.EndpointSlice{}, egressSvcFromEpsFilter).
 		Complete(&egressSvcsReconciler{
 			Client:      mgr.GetClient(),
 			tsNamespace: opts.tailscaleNamespace,
@@ -592,7 +600,6 @@ func runReconcilers(opts reconcilerOpts) {
 		startlog.Fatalf("failed setting up indexer for egress Services: %v", err)
 	}
 
-	egressSvcFromEpsFilter := handler.EnqueueRequestsFromMapFunc(egressSvcFromEps)
 	err = builder.
 		ControllerManagedBy(mgr).
 		Named("egress-svcs-readiness-reconciler").
@@ -641,7 +648,6 @@ func runReconcilers(opts reconcilerOpts) {
 			tsNamespace: opts.tailscaleNamespace,
 			clock:       tstime.DefaultClock{},
 			logger:      opts.log.Named("egress-pods-readiness-reconciler"),
-			httpClient:  http.DefaultClient,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create egress Pods readiness reconciler: %v", err)
@@ -669,26 +675,16 @@ func runReconcilers(opts reconcilerOpts) {
 		startlog.Fatalf("could not create DNS records reconciler: %v", err)
 	}
 
-	// Recorder reconciler.
-	recorderFilter := handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &tsapi.Recorder{})
-	err = builder.ControllerManagedBy(mgr).
-		For(&tsapi.Recorder{}).
-		Named("recorder-reconciler").
-		Watches(&appsv1.StatefulSet{}, recorderFilter).
-		Watches(&corev1.ServiceAccount{}, recorderFilter).
-		Watches(&corev1.Secret{}, recorderFilter).
-		Watches(&rbacv1.Role{}, recorderFilter).
-		Watches(&rbacv1.RoleBinding{}, recorderFilter).
-		Complete(&RecorderReconciler{
-			recorder:    eventRecorder,
-			tsNamespace: opts.tailscaleNamespace,
-			Client:      mgr.GetClient(),
-			log:         opts.log.Named("recorder-reconciler"),
-			clock:       tstime.DefaultClock{},
-			clients:     clients,
-			reissuer:    tailscaled.NewReissuer(),
-		})
-	if err != nil {
+	recorderOptions := recorder.ReconcilerOptions{
+		Client:             mgr.GetClient(),
+		Recorder:           eventRecorder,
+		TailscaleNamespace: opts.tailscaleNamespace,
+		Clients:            clients,
+		Logger:             opts.log,
+		Clock:              tstime.DefaultClock{},
+	}
+
+	if err = recorder.NewReconciler(recorderOptions).Register(mgr); err != nil {
 		startlog.Fatalf("could not create Recorder reconciler: %v", err)
 	}
 
@@ -723,6 +719,7 @@ func runReconcilers(opts reconcilerOpts) {
 	nodeFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(nodeHandlerForProxyGroup(mgr.GetClient(), opts.defaultProxyClass, startlog))
 	saFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(serviceAccountHandlerForProxyGroup(mgr.GetClient(), startlog))
 	acmeSecretFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(acmeAccountsSecretHandlerForProxyGroup(mgr.GetClient(), opts.tailscaleNamespace, opts.sharedACMEAccountKey, startlog))
+	stateSecretFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(stateSecretHandlerForProxyGroup)
 	err = builder.ControllerManagedBy(mgr).
 		For(&tsapi.ProxyGroup{}).
 		Named("proxygroup-reconciler").
@@ -734,6 +731,8 @@ func runReconcilers(opts reconcilerOpts) {
 		// The shared ACME accounts Secret has no ProxyGroup owner ref, so
 		// watch it by name to react to its deletion/recreation.
 		Watches(&corev1.Secret{}, acmeSecretFilterForProxyGroup).
+		// State Secrets have no owner ref, so watch them by label.
+		Watches(&corev1.Secret{}, stateSecretFilterForProxyGroup).
 		Watches(&rbacv1.Role{}, ownedByProxyGroupFilter).
 		Watches(&rbacv1.RoleBinding{}, ownedByProxyGroupFilter).
 		Watches(&tsapi.ProxyClass{}, proxyClassFilterForProxyGroup).
@@ -752,6 +751,7 @@ func runReconcilers(opts reconcilerOpts) {
 			tsFirewallMode:    opts.proxyFirewallMode,
 			defaultProxyClass: opts.defaultProxyClass,
 			loginServer:       opts.tsServer.ControlURL,
+			logLevel:          opts.logLevel,
 			reissuer:          tailscaled.NewReissuer(),
 
 			sharedACMEAccountKey: opts.sharedACMEAccountKey,
@@ -768,6 +768,7 @@ func runReconcilers(opts reconcilerOpts) {
 
 type reconcilerOpts struct {
 	log                *zap.SugaredLogger
+	logLevel           zapcore.Level // configured level; log's own level is debug while log uploads are on
 	tsServer           *tsnet.Server
 	tsClient           *tailscale.Client
 	tailscaleNamespace string       // namespace in which operator resources will be deployed
@@ -1072,6 +1073,60 @@ func nodeHandlerForProxyGroup(cl client.Client, defaultProxyClass string, logger
 	}
 }
 
+// nodeHandlerForConnector returns a handler that, for a given Node, returns a
+// list of reconcile requests for Connectors that should be reconciled for the
+// Node event. Connectors need to be reconciled for Node events if they are
+// configured to expose tailscaled static endpoints to tailnet using NodePort
+// Services.
+func nodeHandlerForConnector(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		cnList := new(tsapi.ConnectorList)
+		if err := cl.List(ctx, cnList); err != nil {
+			logger.Debugf("error listing Connectors for Node: %v", err)
+			return nil
+		}
+
+		reqs := make([]reconcile.Request, 0)
+		for _, cn := range cnList.Items {
+			if cn.Spec.ProxyClass == "" {
+				continue
+			}
+
+			proxyClass := &tsapi.ProxyClass{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: cn.Spec.ProxyClass}, proxyClass); err != nil {
+				if !apierrors.IsNotFound(err) {
+					logger.Debugf("error getting ProxyClass %q: %v", cn.Spec.ProxyClass, err)
+				}
+				continue
+			}
+
+			stat := proxyClass.Spec.StaticEndpoints
+			if stat == nil {
+				continue
+			}
+
+			// If the selector is empty, all nodes match.
+			if len(stat.NodePort.Selector) == 0 {
+				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&cn)})
+				continue
+			}
+
+			selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+				MatchLabels: stat.NodePort.Selector,
+			})
+			if err != nil {
+				logger.Debugf("error converting `spec.staticEndpoints.nodePort.selector` to Selector: %v", err)
+				continue
+			}
+
+			if selector.Matches(klabels.Set(o.GetLabels())) {
+				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&cn)})
+			}
+		}
+		return reqs
+	}
+}
+
 // proxyClassHandlerForProxyGroup returns a handler that, for a given ProxyClass,
 // returns a list of reconcile requests for all ProxyGroups that have
 // .spec.proxyClass set to that ProxyClass.
@@ -1146,6 +1201,21 @@ func acmeAccountsSecretHandlerForProxyGroup(cl client.Client, tsNamespace string
 		}
 		return reqs
 	}
+}
+
+// stateSecretHandlerForProxyGroup enqueues the ProxyGroup that a state Secret
+// belongs to. State Secrets carry no owner reference, so the owner-based Secret
+// watch never matches them.
+func stateSecretHandlerForProxyGroup(_ context.Context, o client.Object) []reconcile.Request {
+	secret, ok := o.(*corev1.Secret)
+	if !ok || !isPGStateSecret(secret) {
+		return nil
+	}
+	pgName := secret.ObjectMeta.Labels[LabelParentName]
+	if pgName == "" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: pgName}}}
 }
 
 // serviceHandlerForIngress returns a handler for Service events for ingress

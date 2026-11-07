@@ -10,12 +10,45 @@ import (
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 )
 
 // NewDevice returns a wireguard-go Device configured for Tailscale use.
 func NewDevice(tunDev tun.Device, bind conn.Bind, logger *device.Logger) *device.Device {
-	return device.NewDevice(tunDev, bind, logger, getDeviceOptions()...)
+	return device.NewDevice(tunDev, bind, logger, append(getMemoryOptions(), getDeviceMetrics())...)
 }
+
+func getDeviceMetrics() device.Option {
+	return device.WithMetrics(device.Metrics{
+		MessageInitiationTXAttemptInitial:       metricMessageInitiationTXAttemptInitial,
+		MessageHybridInitiationTXAttemptInitial: metricMessageHybridInitiationTXAttemptInitial,
+		MessageInitiationTXAttemptRetry:         metricMessageInitiationTXAttemptRetry,
+		MessageHybridInitiationTXAttemptRetry:   metricMessageHybridInitiationTXAttemptRetry,
+		MessageResponseTXAttempt:                metricMessageResponseTXAttempt,
+		MessageHybridResponseTXAttempt:          metricMessageHybridResponseTXAttempt,
+		MessageCookieReplyTXAttempt:             metricMessageCookieReplyTXAttempt,
+		HandshakeInitiatorCompleted:             metricHandshakeInitiatorCompleted,
+		HandshakeHybridInitiatorCompleted:       metricHandshakeHybridInitiatorCompleted,
+		HandshakeResponderCompleted:             metricHandshakeResponderCompleted,
+		HandshakeHybridResponderCompleted:       metricHandshakeHybridResponderCompleted,
+		MessageTransportRXDroppedReplay:         metricMessageTransportRXDroppedReplay,
+	})
+}
+
+var (
+	metricMessageInitiationTXAttemptInitial       = clientmetric.NewCounter("wireguard_message_initiation_tx_attempt_initial")
+	metricMessageHybridInitiationTXAttemptInitial = clientmetric.NewCounter("wireguard_message_hybrid_initiation_tx_attempt_initial")
+	metricMessageInitiationTXAttemptRetry         = clientmetric.NewCounter("wireguard_message_initiation_tx_attempt_retry")
+	metricMessageHybridInitiationTXAttemptRetry   = clientmetric.NewCounter("wireguard_message_hybrid_initiation_tx_attempt_retry")
+	metricMessageResponseTXAttempt                = clientmetric.NewCounter("wireguard_message_response_tx_attempt")
+	metricMessageHybridResponseTXAttempt          = clientmetric.NewCounter("wireguard_message_hybrid_response_tx_attempt")
+	metricMessageCookieReplyTXAttempt             = clientmetric.NewCounter("wireguard_message_cookie_reply_tx_attempt")
+	metricHandshakeInitiatorCompleted             = clientmetric.NewCounter("wireguard_handshake_initiator_completed")
+	metricHandshakeHybridInitiatorCompleted       = clientmetric.NewCounter("wireguard_handshake_hybrid_initiator_completed")
+	metricHandshakeResponderCompleted             = clientmetric.NewCounter("wireguard_handshake_responder_completed")
+	metricHandshakeHybridResponderCompleted       = clientmetric.NewCounter("wireguard_handshake_hybrid_responder_completed")
+	metricMessageTransportRXDroppedReplay         = clientmetric.NewCounter("wireguard_message_transport_rx_dropped_replay")
+)
 
 // NewPeerLookupFunc returns a [device.PeerLookupFunc] that lazily
 // creates peers using peerConfig as the source of each peer's allowed IPs and
@@ -35,6 +68,7 @@ func NewPeerLookupFunc(bind conn.Bind, logf logger.Logf, peerConfig func(device.
 		return &device.NewPeerConfig{
 			AllowedIPs:   conf.AllowedIPs,
 			PresharedKey: conf.PresharedKey,
+			Hybrid:       conf.Hybrid,
 			Endpoint:     ep,
 		}, true
 	}

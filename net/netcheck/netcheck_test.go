@@ -47,7 +47,12 @@ func TestBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, err := c.GetReport(ctx, stuntest.DERPMapOf(stunAddr.String()), nil)
+	dm := stuntest.DERPMapOf(stunAddr.String())
+	// stuntest nodes are all STUNOnly; make this a regular DERP region so
+	// that the PreferredDERP assertion below exercises the normal path.
+	dm.Regions[1].Nodes[0].STUNOnly = false
+
+	r, err := c.GetReport(ctx, dm, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +132,51 @@ func TestSTUNResponseProvesCanSend(t *testing.T) {
 				t.Errorf("STUN response from %v did not set %sCanSend", test.addr, test.name)
 			}
 		})
+	}
+}
+
+// TestSTUNOnlyRegionNotPreferredDERP verifies a STUNOnly region is
+// never selected as the preferred DERP, even when it's the only region
+// with a STUN latency sample (as in real setups where only a public
+// STUN server is reachable, e.g. self-hosted DERP behind a TCP-only
+// tunnel), where selecting it would blackhole all relay traffic.
+func TestSTUNOnlyRegionNotPreferredDERP(t *testing.T) {
+	// Region 1: a real, reachable STUN server marked STUNOnly.
+	stunAddr, cleanup := stuntest.Serve(t)
+	defer cleanup()
+
+	// Region 2: a UDP blackhole (unreachable) normal DERP region.
+	blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to open blackhole STUN listener: %v", err)
+	}
+	defer blackhole.Close()
+
+	dm := stuntest.DERPMapOf(stunAddr.String(), blackhole.LocalAddr().String())
+	dm.Regions[1].Nodes[0].STUNOnly = true
+	dm.Regions[2].Nodes[0].STUNOnly = false
+
+	c := newTestClient(t)
+
+	ctx := t.Context()
+
+	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := c.GetReport(ctx, dm, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The STUN-only region must have produced a latency sample...
+	if _, ok := r.RegionLatency[1]; !ok {
+		t.Fatalf("expected region 1 (STUNOnly) to have a STUN latency sample; got %+v", r.RegionLatency)
+	}
+	// ...but must not be selected as the preferred DERP, even though it
+	// is the only region with a latency sample.
+	if r.PreferredDERP == 1 {
+		t.Errorf("PreferredDERP = 1 (STUNOnly region); want a region with DERP nodes")
 	}
 }
 
@@ -224,6 +274,11 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 		forcedDERP  tailcfg.DERPRegionID // if non-zero, force this DERP to be the preferred one
 		wantDERP    tailcfg.DERPRegionID // want PreferredDERP on final step
 		wantPrevLen int                  // wanted len(c.prev)
+
+		// lastRegions, if non-nil, are the only DERP regions in the
+		// DERP map for the final step, simulating regions being removed
+		// by control. Otherwise, regions 1, 2, and 3 are always present.
+		lastRegions []tailcfg.DERPRegionID
 	}{
 		{
 			name: "first_reading",
@@ -472,6 +527,65 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			wantPrevLen: 3,
 			wantDERP:    0,
 		},
+		{
+			name: "removed_home_with_traffic",
+			steps: []step{
+				{0, report("d1", 2, "d2", 3)},
+				{2 * time.Second, report("d2", 3)},
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[tailcfg.DERPRegionID]time.Time{
+					1: startTime.Add(2 * time.Second), // within active window
+				}),
+			},
+			lastRegions: []tailcfg.DERPRegionID{2, 3},
+			wantPrevLen: 2,
+			wantDERP:    2, // d1 was removed; recent traffic doesn't matter
+		},
+		{
+			name: "removed_home_no_data",
+			steps: []step{
+				{0, report("d1", 2, "d2", 3)},
+				{2 * time.Second, report()},
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[tailcfg.DERPRegionID]time.Time{
+					1: startTime.Add(2 * time.Second),
+				}),
+			},
+			lastRegions: []tailcfg.DERPRegionID{2, 3},
+			wantPrevLen: 2,
+			wantDERP:    0, // don't keep removed d1 as a no-data fallback
+		},
+		{
+			name: "forced_removed",
+			steps: []step{
+				{time.Second, report("d1", 2, "d2", 3)},
+				{2 * time.Second, report("d1", 2)},
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[tailcfg.DERPRegionID]time.Time{
+					2: startTime.Add(3 * time.Second),
+				}),
+			},
+			forcedDERP:  2,
+			lastRegions: []tailcfg.DERPRegionID{1, 3},
+			wantPrevLen: 2,
+			wantDERP:    1,
+		},
+	}
+	mkDERPMap := func(homeParams *tailcfg.DERPHomeParams, regions ...tailcfg.DERPRegionID) *tailcfg.DERPMap {
+		dm := &tailcfg.DERPMap{
+			HomeParams: homeParams,
+			Regions:    map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{},
+		}
+		for _, id := range regions {
+			dm.Regions[id] = &tailcfg.DERPRegion{
+				RegionID: id,
+				Nodes:    []*tailcfg.DERPNode{{RegionID: id, Name: fmt.Sprintf("%da", id), HostName: fmt.Sprintf("derp%d.invalid", id)}},
+			}
+		}
+		return dm
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -480,15 +594,18 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 				TimeNow:            func() time.Time { return fakeTime },
 				ForcePreferredDERP: tt.forcedDERP,
 			}
-			dm := &tailcfg.DERPMap{HomeParams: tt.homeParams}
+			dm := mkDERPMap(tt.homeParams, 1, 2, 3)
 			rs := &reportState{
 				c:     c,
 				start: fakeTime,
 				opts:  tt.opts,
 			}
-			for _, s := range tt.steps {
+			for i, s := range tt.steps {
 				fakeTime = fakeTime.Add(s.after)
 				rs.start = fakeTime.Add(-100 * time.Millisecond)
+				if i == len(tt.steps)-1 && tt.lastRegions != nil {
+					dm = mkDERPMap(tt.homeParams, tt.lastRegions...)
+				}
 				c.addReportHistoryAndSetPreferredDERP(rs, s.r, dm.View(), fakeTime)
 			}
 			lastReport := tt.steps[len(tt.steps)-1].r

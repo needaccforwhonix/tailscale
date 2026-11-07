@@ -936,8 +936,10 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		go rs.probePortMapServices()
 	}
 
+	// Without NAT traversal, we never send STUN: we behave as if UDP were
+	// blocked and measure DERP latency over HTTPS (and ICMP) instead.
 	var plan probePlan
-	if opts == nil || !opts.OnlyTCP443 {
+	if buildfeatures.HasNATTraversal && (opts == nil || !opts.OnlyTCP443) {
 		plan = makeProbePlan(dm, ifState, last, preferredDERP)
 	}
 
@@ -955,16 +957,18 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	}
 
 	wg := syncs.NewWaitGroupChan()
-	wg.Add(len(plan))
-	for _, probeSet := range plan {
-		setCtx, cancelSet := context.WithCancel(ctx)
-		go func(probeSet []probe) {
-			for _, probe := range probeSet {
-				go rs.runProbe(setCtx, dm, probe, cancelSet)
-			}
-			<-setCtx.Done()
-			wg.Decr()
-		}(probeSet)
+	if buildfeatures.HasNATTraversal {
+		wg.Add(len(plan))
+		for _, probeSet := range plan {
+			setCtx, cancelSet := context.WithCancel(ctx)
+			go func(probeSet []probe) {
+				for _, probe := range probeSet {
+					go rs.runProbe(setCtx, dm, probe, cancelSet)
+				}
+				<-setCtx.Done()
+				wg.Decr()
+			}(probeSet)
+		}
 	}
 
 	stunTimer := time.NewTimer(stunProbeTimeout)
@@ -1000,12 +1004,15 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		var wg sync.WaitGroup
 		var need []*tailcfg.DERPRegion
 		for rid, reg := range dm.Regions {
-			if !rs.haveRegionLatency(tailcfg.DERPRegionID(rid)) && regionHasDERPNode(reg) && !reg.Avoid && !reg.NoMeasureNoHome {
+			if !rs.haveRegionLatency(tailcfg.DERPRegionID(rid)) && reg.CanServeDERP() && !reg.Avoid && !reg.NoMeasureNoHome {
 				need = append(need, reg)
 			}
 		}
 		if len(need) > 0 {
-			if opts == nil || !opts.OnlyTCP443 {
+			// Without UDP to peers, DERP is our only transport and its
+			// latency is measured over HTTPS alone; ICMP is not worth
+			// linking in just for that.
+			if buildfeatures.HasUDPTransport && (opts == nil || !opts.OnlyTCP443) {
 				// Kick off ICMP in parallel to HTTPS checks; we don't
 				// reuse the same WaitGroup for those probes because we
 				// need to close the underlying Pinger after a timeout
@@ -1420,8 +1427,10 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Ignore the previous preferred DERP if it's since been removed from
+	// the DERP map, so the stickiness checks below can't pick it again.
 	var prevDERP tailcfg.DERPRegionID
-	if c.last != nil {
+	if c.last != nil && dm.Regions().Contains(c.last.PreferredDERP) {
 		prevDERP = c.last.PreferredDERP
 	}
 
@@ -1455,6 +1464,14 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 		// change), so we need to do it here as well.
 		if score := scores.Get(regionID); score > 0 {
 			d = time.Duration(float64(d) * score)
+		}
+
+		// A STUN-only region has no DERP server to relay through, so it must
+		// never become the preferred DERP even though its STUN probe gives it
+		// a RegionLatency entry. Regions missing from the map or without any
+		// DERP server are equally unable to serve as a home.
+		if !dm.Regions().Get(regionID).CanServeDERP() {
+			continue
 		}
 
 		if regionID == prevDERP {
@@ -1503,7 +1520,7 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 		// which undoes any region change we made above.
 		r.PreferredDERP = prevDERP
 	}
-	if c.ForcePreferredDERP != 0 {
+	if c.ForcePreferredDERP != 0 && dm.Regions().Contains(c.ForcePreferredDERP) {
 		// If the forced DERP region probed successfully, or has recent traffic,
 		// use it.
 		_, haveLatencySample := r.RegionLatency[c.ForcePreferredDERP]
@@ -1744,15 +1761,6 @@ func (c *Client) nodeAddrPort(ctx context.Context, n *tailcfg.DERPNode, port int
 		c.logf("netcheck: DNS lookup error for %q (node %q region %v): %v", n.HostName, n.Name, n.RegionID, err)
 	}
 	return zero, false
-}
-
-func regionHasDERPNode(r *tailcfg.DERPRegion) bool {
-	for _, n := range r.Nodes {
-		if !n.STUNOnly {
-			return true
-		}
-	}
-	return false
 }
 
 func maxDurationValue(m map[tailcfg.DERPRegionID]time.Duration) (max time.Duration) {

@@ -60,8 +60,8 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/httpbody"
 	"tailscale.com/util/singleflight"
-	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/vizerror"
@@ -109,6 +109,7 @@ type Direct struct {
 
 	persist                 persist.PersistView
 	authKey                 string
+	tailnet                 string // optional recommended/required tailnet for registration; see [tailcfg.RegisterRequest.Tailnet]
 	tryingNewKey            key.NodePrivate
 	expiry                  time.Time         // or zero value if none/unknown
 	hostinfo                *tailcfg.Hostinfo // always non-nil
@@ -139,6 +140,7 @@ type Options struct {
 	GetMachinePrivateKey func() (key.MachinePrivate, error) // returns the machine key to use
 	ServerURL            string                             // URL of the tailcontrol server
 	AuthKey              string                             // optional node auth key for auto registration
+	Tailnet              string                             // optional recommended/required tailnet for registration; see [tailcfg.RegisterRequest.Tailnet]
 	Clock                tstime.Clock
 	Hostinfo             *tailcfg.Hostinfo // non-nil passes ownership, nil means to use default using os.Hostname, etc
 	DiscoPublicKey       key.DiscoPublic
@@ -375,6 +377,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		logf:              opts.Logf,
 		persist:           opts.Persist.View(),
 		authKey:           opts.AuthKey,
+		tailnet:           opts.Tailnet,
 		debugFlags:        opts.DebugFlags,
 		netMon:            netMon,
 		health:            opts.HealthTracker,
@@ -587,6 +590,11 @@ var macOSScreenTime = health.Register(&health.Warnable{
 	ImpactsConnectivity: true,
 })
 
+// ErrNodeRemoved is wrapped by the error returned from a map request that
+// control responded to with a 404, which it only does once the node, or the
+// user or login that owns it, has been deleted.
+var ErrNodeRemoved = errors.New("node removed from tailnet")
+
 type rateLimitError struct {
 	msg        string
 	retryAfter time.Duration
@@ -718,7 +726,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		oldNodeKey = persist.OldPrivateNodeKey.Public()
 	}
 	if persist.NetworkLockKey.IsZero() {
-		persist.NetworkLockKey = key.NewNLPrivate()
+		persist.NetworkLockKey = key.NewTLPrivate()
 	}
 
 	nlPub := persist.NetworkLockKey.Public()
@@ -750,10 +758,6 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		return regen, opt.URL, nil, err
 	}
 
-	tailnet, err := c.polc.GetString(pkey.Tailnet, "")
-	if err != nil {
-		c.logf("unable to provide Tailnet field in register request. err: %v", err)
-	}
 	now := c.clock.Now().Round(time.Second)
 	request := tailcfg.RegisterRequest{
 		Version:          1,
@@ -765,7 +769,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		Timestamp:        &now,
 		Ephemeral:        (opt.Flags & LoginEphemeral) != 0,
 		NodeKeySignature: nodeKeySignature,
-		Tailnet:          tailnet,
+		Tailnet:          c.tailnet,
 	}
 	if opt.Logout {
 		request.Expiry = time.Unix(123, 0) // far in the past
@@ -1146,6 +1150,15 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// The map response body is a stream of size-prefixed messages. Each
+	// message is capped by maxCompressedMapResponseSize and
+	// maxDecodedMapResponseSize, but a streaming session can carry an
+	// unbounded number of messages over one body, so the body itself must
+	// not be subject to ts2021.Client.Do's default response size cap.
+	// This must happen before the watchdog goroutine below captures ctx:
+	// reassigning ctx after the goroutine exists is a data race.
+	ctx = httpbody.WithMaxSize(ctx, 0)
+
 	machinePubKey := machinePrivKey.Public()
 	t0 := c.clock.Now()
 
@@ -1193,14 +1206,21 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	}
 	vlogf("netmap: Do = %v after %v", res.StatusCode, time.Since(t0).Round(time.Millisecond))
 	if res.StatusCode != 200 {
+		// The body is an error message rather than a message stream, so
+		// cap it: the map body itself is uncapped per the comment above.
+		httpbody.LimitSizeTo(res, httpbody.DefaultMaxSize)
 		if isRateLimitedResponse(res) {
 			rle := parseRateLimitError(res)
 			return fmt.Errorf("initial fetch failed %d: %w", res.StatusCode, rle)
 		}
 		msg, _ := io.ReadAll(res.Body)
 		res.Body.Close()
-		return fmt.Errorf("initial fetch failed %d: %.200s",
+		err := fmt.Errorf("initial fetch failed %d: %.200s",
 			res.StatusCode, strings.TrimSpace(string(msg)))
+		if res.StatusCode == http.StatusNotFound {
+			err = fmt.Errorf("%w: %w", ErrNodeRemoved, err)
+		}
+		return err
 	}
 	defer res.Body.Close()
 
@@ -1253,8 +1273,8 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	for mapResIdx := 0; mapResIdx == 0 || isStreaming; mapResIdx++ {
 		watchdogTimer.Reset(watchdogTimeout)
 		vlogf("netmap: starting size read after %v (poll %v)", time.Since(t0).Round(time.Millisecond), mapResIdx)
-		var siz [4]byte
-		if _, err := io.ReadFull(res.Body, siz[:]); err != nil {
+		msg, err = readMapResponseMessage(res.Body, msg)
+		if err != nil {
 			// If the read failed because the poll's context was
 			// canceled, report that instead of the underlying
 			// transport error. Which error the transport returns for
@@ -1265,20 +1285,10 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 			if ctx.Err() != nil {
 				err = ctx.Err()
 			}
-			vlogf("netmap: size read error after %v: %v", time.Since(t0).Round(time.Millisecond), err)
+			vlogf("netmap: message read error after %v: %v", time.Since(t0).Round(time.Millisecond), err)
 			return err
 		}
-		size := binary.LittleEndian.Uint32(siz[:])
-		vlogf("netmap: read size %v after %v", size, time.Since(t0).Round(time.Millisecond))
-		msg = append(msg[:0], make([]byte, size)...)
-		if _, err := io.ReadFull(res.Body, msg); err != nil {
-			if ctx.Err() != nil {
-				err = ctx.Err()
-			}
-			vlogf("netmap: body read error: %v", err)
-			return err
-		}
-		vlogf("netmap: read body after %v", time.Since(t0).Round(time.Millisecond))
+		vlogf("netmap: read message of %d bytes after %v", len(msg), time.Since(t0).Round(time.Millisecond))
 
 		var resp tailcfg.MapResponse
 		if err := sess.decodeMsg(msg, &resp); err != nil {
@@ -1448,6 +1458,39 @@ var jsonEscapedZero = []byte(`\u0000`)
 
 const justKeepAliveStr = `{"KeepAlive":true}`
 
+// maxCompressedMapResponseSize bounds the on-the-wire size of a single map
+// response message. The size prefix is a little-endian uint32 the control
+// server chooses, so without a cap a malicious control server can make us
+// allocate up to 4 GiB before reading any body bytes. Real production traffic
+// has hit a 16 MB cap before, so the cap stays far above any plausible
+// legitimate size.
+const maxCompressedMapResponseSize = 256 << 20
+
+// maxDecodedMapResponseSize bounds the decompressed size of a single map
+// response message, so a malicious control server can't expand a small zstd
+// frame into an unbounded amount of JSON.
+const maxDecodedMapResponseSize = 1 << 30
+
+// readMapResponseMessage reads a single map response message from r: a
+// little-endian uint32 size followed by that many bytes. The returned message
+// reuses msg's backing storage. Sizes beyond [maxCompressedMapResponseSize]
+// are rejected before any allocation.
+func readMapResponseMessage(r io.Reader, msg []byte) ([]byte, error) {
+	var siz [4]byte
+	if _, err := io.ReadFull(r, siz[:]); err != nil {
+		return msg, err
+	}
+	size := binary.LittleEndian.Uint32(siz[:])
+	if size > maxCompressedMapResponseSize {
+		return msg, fmt.Errorf("map response message size %d exceeds max %d", size, maxCompressedMapResponseSize)
+	}
+	msg = append(msg[:0], make([]byte, size)...)
+	if _, err := io.ReadFull(r, msg); err != nil {
+		return msg, err
+	}
+	return msg, nil
+}
+
 // decodeMsg is responsible for uncompressing msg and unmarshaling into v.
 func (ms *mapSession) decodeMsg(compressedMsg []byte, v *tailcfg.MapResponse) error {
 	// Fast path for common case of keep-alive message.
@@ -1457,7 +1500,7 @@ func (ms *mapSession) decodeMsg(compressedMsg []byte, v *tailcfg.MapResponse) er
 		return nil
 	}
 
-	b, err := zstdframe.AppendDecode(nil, compressedMsg)
+	b, err := zstdframe.AppendDecode(nil, compressedMsg, zstdframe.MaxDecodedSize(maxDecodedMapResponseSize))
 	if err != nil {
 		return err
 	}
@@ -1507,7 +1550,8 @@ func loadServerPubKeys(ctx context.Context, httpc *http.Client, serverURL string
 		return nil, fmt.Errorf("fetch control key: %v", err)
 	}
 	defer res.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+	httpbody.LimitSizeTo(res, 64<<10)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, fmt.Errorf("fetch control key response: %v", err)
 	}
